@@ -11,52 +11,21 @@ license as described in the file LICENSE.
 #include "cache.h"
 #include "unique_sort.h"
 #include "global_data.h"
+#include "constant.h"
+#include "memory.h"
 
 using namespace std;
-
-size_t hashstring (substring s, uint32_t h)
-{
-  size_t ret = 0;
-  //trim leading whitespace but not UTF-8
-  for(; s.begin < s.end && *(s.begin) <= 0x20 && (int)*(s.begin) >= 0; s.begin++);
-  //trim trailing white space but not UTF-8
-  for(; s.end > s.begin && *(s.end-1) <= 0x20 && (int)*(s.end-1) >=0; s.end--);
-
-  char *p = s.begin;
-  while (p != s.end)
-    if (*p >= '0' && *p <= '9')
-      ret = 10*ret + *(p++) - '0';
-    else
-      return uniform_hash((unsigned char *)s.begin, s.end - s.begin, h);
-
-  return ret + h;
-}
-
-size_t hashall (substring s, uint32_t h)
-{
-  return uniform_hash((unsigned char *)s.begin, s.end - s.begin, h);
-}
-
-hash_func_t getHasher(const string& s){
-  if (s=="strings")
-    return hashstring;
-  else if(s=="all")
-    return hashall;
-  else{
-    cerr << "Unknown hash function: " << s << ". Exiting " << endl;
-    throw exception();
-  }
-}
 
 char* copy(char* base)
 {
   size_t len = 0;
   while (base[len++] != '\0');
-  char* ret = (char *)calloc(len,sizeof(char));
+  char* ret = (char *)calloc_or_die(len,sizeof(char));
   memcpy(ret,base,len);
   return ret;
 }
 
+template<bool audit>
 class TC_parser {
   
 public:
@@ -66,19 +35,21 @@ public:
   float cur_channel_v;
   bool  new_index;
   size_t anon; 
-  bool audit;
   size_t channel_hash;
   char* base;
   unsigned char index;
   float v;
   parser* p;
   example* ae;
-  uint32_t weights_per_problem;
+  uint32_t* affix_features;
+  bool* spelling_features;
+  v_array<char> spelling;
+  vector<feature_dict*>* namespace_dictionaries;
   
   ~TC_parser(){ }
   
   inline float featureValue(){
-    if(reading_head == endLine || *reading_head == '|' || *reading_head == ' ' || *reading_head == '\t' || *reading_head == '\r')
+    if(*reading_head == ' ' || *reading_head == '\t' || *reading_head == '|' || reading_head == endLine || *reading_head == '\r')
       return 1.;
     else if(*reading_head == ':'){
       // featureValue --> ':' 'Float'
@@ -104,9 +75,10 @@ public:
   inline substring read_name(){
     substring ret;
     ret.begin = reading_head;
-    while( !(*reading_head == ' ' || *reading_head == '\t' || *reading_head == ':' ||*reading_head == '|' || reading_head == endLine || *reading_head == '\r' ))
+    while( !(*reading_head == ' ' || *reading_head == ':' || *reading_head == '\t' || *reading_head == '|' || reading_head == endLine || *reading_head == '\r' ))
       ++reading_head;
     ret.end = reading_head;
+
     return ret;
   }
   
@@ -123,15 +95,106 @@ public:
       else
 	word_hash = channel_hash + anon++;
       if(v == 0) return; //dont add 0 valued features to list of features
-      feature f = {v,(uint32_t)word_hash * weights_per_problem};
+      feature f = {v,(uint32_t)word_hash };
       ae->sum_feat_sq[index] += v*v;
       ae->atomics[index].push_back(f);
       if(audit){
-	v_array<char> feature_v;
+	v_array<char> feature_v = v_init<char>();
 	push_many(feature_v, feature_name.begin, feature_name.end - feature_name.begin);
 	feature_v.push_back('\0');
 	audit_data ad = {copy(base),feature_v.begin,word_hash,v,true};
 	ae->audit_features[index].push_back(ad);
+      }
+      if ((affix_features[index] > 0) && (feature_name.end != feature_name.begin)) {
+        if (ae->atomics[affix_namespace].size() == 0)
+          ae->indices.push_back(affix_namespace);
+        uint32_t affix = affix_features[index];
+        while (affix > 0) {
+          bool is_prefix = affix & 0x1;
+          uint32_t len   = (affix >> 1) & 0x7;
+          substring affix_name = { feature_name.begin, feature_name.end };
+          if (affix_name.end > affix_name.begin + len) {
+            if (is_prefix)
+              affix_name.end = affix_name.begin + len;
+            else
+              affix_name.begin = affix_name.end - len;
+          }
+          word_hash = p->hasher(affix_name,(uint32_t)channel_hash) * (affix_constant + (affix & 0xF) * quadratic_constant);
+          feature f2 = { v, (uint32_t) word_hash };
+          ae->sum_feat_sq[affix_namespace] += v*v;
+          ae->atomics[affix_namespace].push_back(f2);
+          if (audit) {
+            v_array<char> affix_v = v_init<char>();
+            if (index != ' ') affix_v.push_back(index);
+            affix_v.push_back(is_prefix ? '+' : '-');
+            affix_v.push_back('0' + len);
+            affix_v.push_back('=');
+            push_many(affix_v, affix_name.begin, affix_name.end - affix_name.begin);
+            affix_v.push_back('\0');
+            audit_data ad = {copy((char*)"affix"),affix_v.begin,word_hash,v,true};
+            ae->audit_features[affix_namespace].push_back(ad);
+          }
+          
+          affix >>= 4;
+        }
+      }
+      if (spelling_features[index]) {
+        if (ae->atomics[spelling_namespace].size() == 0)
+          ae->indices.push_back(spelling_namespace);
+        //v_array<char> spelling;
+        spelling.erase();
+        for (char*c = feature_name.begin; c!=feature_name.end; ++c) {
+          char d = 0;
+          if      ((*c >= '0') && (*c <= '9')) d = '0';
+          else if ((*c >= 'a') && (*c <= 'z')) d = 'a';
+          else if ((*c >= 'A') && (*c <= 'Z')) d = 'A';
+          else if  (*c == '.')                 d = '.';
+          else                                 d = '#';
+          //if ((spelling.size() == 0) || (spelling.last() != d))
+            spelling.push_back(d);
+        }
+        substring spelling_ss = { spelling.begin, spelling.end };
+        size_t word_hash = hashstring(spelling_ss, (uint32_t)channel_hash);
+        feature f2 = { v, (uint32_t) word_hash };
+        ae->sum_feat_sq[spelling_namespace] += v*v;
+        ae->atomics[spelling_namespace].push_back(f2);
+        if (audit) {
+          v_array<char> spelling_v = v_init<char>();
+          if (index != ' ') { spelling_v.push_back(index); spelling_v.push_back('_'); }
+          push_many(spelling_v, spelling_ss.begin, spelling_ss.end - spelling_ss.begin);
+          spelling_v.push_back('\0');
+          audit_data ad = {copy((char*)"spelling"),spelling_v.begin,word_hash,v,true};
+          ae->audit_features[spelling_namespace].push_back(ad);
+        }
+      }
+      if (namespace_dictionaries[index].size() > 0) {
+        for (size_t dict=0; dict<namespace_dictionaries[index].size(); dict++) {
+          feature_dict* map = namespace_dictionaries[index][dict];
+          uint32_t hash = uniform_hash(feature_name.begin, feature_name.end-feature_name.begin, quadratic_constant);
+          v_array<feature>* feats = map->get(feature_name, hash);
+          if ((feats != NULL) && (feats->size() > 0)) {
+            if (ae->atomics[dictionary_namespace].size() == 0)
+              ae->indices.push_back(dictionary_namespace);
+            push_many(ae->atomics[dictionary_namespace], feats->begin, feats->size());
+            for (feature*f = feats->begin; f != feats->end; ++f)
+              ae->sum_feat_sq[dictionary_namespace] += f->x * f->x;
+            if (audit) {
+              for (feature*f = feats->begin; f != feats->end; ++f) {
+                uint32_t id = f->weight_index;
+                size_t len = 2 + (feature_name.end-feature_name.begin) + 1 + (size_t)ceil(log10(id)) + 1;
+                char* str = (char*)calloc(len, sizeof(char));
+                str[0] = index;
+                str[1] = '_';
+                char *c = str+2;
+                for (char* fc=feature_name.begin; fc!=feature_name.end; ++fc) *(c++) = *fc;
+                *(c++) = '=';
+                sprintf(c, "%d", id);
+                audit_data ad = { copy((char*)"dictionary"), str, f->weight_index, f->x, true };
+                ae->audit_features[dictionary_namespace].push_back(ad);
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -169,9 +232,11 @@ public:
 	new_index = true;
       substring name = read_name();
       if(audit){
-	v_array<char> base_v_array;
+	v_array<char> base_v_array = v_init<char>();
 	push_many(base_v_array, name.begin, name.end - name.begin);
 	base_v_array.push_back('\0');
+	if (base != NULL)
+	  free(base);
 	base = base_v_array.begin;
       }
       channel_hash = p->hasher(name, hash_base);
@@ -190,11 +255,9 @@ public:
       cout << "malformed example !\n'|' , space or EOL expected after : \"" << std::string(beginLine, reading_head - beginLine).c_str() << "\"" << endl;
     }
   }
-  
-  
+    
   inline void nameSpace(){
     cur_channel_v = 1.0;
-    base = NULL;
     index = 0;
     new_index = false;
     anon = 0;
@@ -205,7 +268,9 @@ public:
 	new_index = true;
       if(audit)
 	{
-	  base = (char *) calloc(2,sizeof(char));
+	  if (base != NULL)
+	    free(base);
+	  base = (char *) calloc_or_die(2,sizeof(char));
 	  base[0] = ' ';
 	  base[1] = '\0';
 	}
@@ -224,8 +289,7 @@ public:
   }
   
   inline void listNameSpace(){
-    while(*reading_head == '|'){
-      // ListNameSpace --> '|' NameSpace ListNameSpace
+    while(*reading_head == '|'){ // ListNameSpace --> '|' NameSpace ListNameSpace
       ++reading_head;
       nameSpace();
     }
@@ -237,21 +301,27 @@ public:
   }
 
   TC_parser(char* reading_head, char* endLine, vw& all, example* ae){
-    this->beginLine = reading_head;
-    this->reading_head = reading_head;
-    this->endLine = endLine;
-    this->p = all.p;
-    this->ae = ae;
-    this->weights_per_problem = all.weights_per_problem;
-    audit = all.audit || all.hash_inv;
-    listNameSpace();
+    if (endLine != reading_head)
+      {
+	this->beginLine = reading_head;
+	this->reading_head = reading_head;
+	this->endLine = endLine;
+	this->p = all.p;
+	this->ae = ae;
+	this->affix_features = all.affix_features;
+	this->spelling_features = all.spelling_features;
+        this->namespace_dictionaries = all.namespace_dictionaries;
+	this->base = NULL;
+	listNameSpace();
+	if (base != NULL)
+	  free(base);
+      }
   }
-
 };
 
 void substring_to_example(vw* all, example* ae, substring example)
 {
-  all->p->lp->default_label(ae->ld);
+  all->p->lp.default_label(&ae->l);
   char* bar_location = safe_index(example.begin, '|', example.end);
   char* tab_location = safe_index(example.begin, '\t', bar_location);
   substring label_space;
@@ -276,9 +346,12 @@ void substring_to_example(vw* all, example* ae, substring example)
   }
 
   if (all->p->words.size() > 0)
-    all->p->lp->parse_label(all->p, all->sd, ae->ld, all->p->words);
+    all->p->lp.parse_label(all->p, all->sd, &ae->l, all->p->words);
   
-  TC_parser parser_line(bar_location,example.end,*all,ae);
+  if (all->audit || all->hash_inv)
+    TC_parser<true> parser_line(bar_location,example.end,*all,ae);
+  else
+    TC_parser<false> parser_line(bar_location,example.end,*all,ae);
 }
 
 int read_features(void* in, example* ex)
@@ -307,5 +380,6 @@ int read_features(void* in, example* ex)
 void read_line(vw& all, example* ex, char* line)
 {
   substring ss = {line, line+strlen(line)};
+  while ((ss.end >= ss.begin) && (*(ss.end-1) == '\n')) ss.end--;
   substring_to_example(&all, ex, ss);  
 }

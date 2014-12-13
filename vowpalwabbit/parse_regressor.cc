@@ -14,11 +14,13 @@ using namespace std;
 #include <stdint.h>
 #include <math.h>
 #include <algorithm>
+
 #include "parse_regressor.h"
 #include "loss_functions.h"
-#include "global_data.h"
 #include "io_buf.h"
+#include "memory.h"
 #include "rand48.h"
+#include "global_data.h"
 
 /* Define the last version where files are backward compatible. */
 #define LAST_COMPATIBLE_VERSION "6.1.3"
@@ -26,9 +28,14 @@ using namespace std;
 
 void initialize_regressor(vw& all)
 {
+  // Regressor is already initialized.
+  if (all.reg.weight_vector != NULL) {
+    return;
+  }
+
   size_t length = ((size_t)1) << all.num_bits;
-  all.reg.weight_mask = (all.reg.stride * length) - 1;
-  all.reg.weight_vector = (weight *)calloc(all.reg.stride*length, sizeof(weight));
+  all.reg.weight_mask = (length << all.reg.stride_shift) - 1;
+  all.reg.weight_vector = (weight *)calloc_or_die(length << all.reg.stride_shift, sizeof(weight));
   if (all.reg.weight_vector == NULL)
     {
       cerr << all.program_name << ": Failed to allocate weight array with " << all.num_bits << " bits: try decreasing -b <bits>" << endl;
@@ -37,10 +44,15 @@ void initialize_regressor(vw& all)
   if (all.random_weights)
     {
       for (size_t j = 0; j < length; j++)
-	all.reg.weight_vector[j*all.reg.stride] = (float)(frand48() - 0.5);
+	all.reg.weight_vector[j << all.reg.stride_shift] = (float)(frand48() - 0.5);
+    }
+  if (all.random_positive_weights)
+    {
+      for (size_t j = 0; j < length; j++)
+	all.reg.weight_vector[j << all.reg.stride_shift] = (float)(0.1 * frand48());
     }
   if (all.initial_weight != 0.)
-    for (size_t j = 0; j < all.reg.stride*length; j+=all.reg.stride)
+    for (size_t j = 0; j < length << all.reg.stride_shift; j+= ( ((size_t)1) << all.reg.stride_shift))
       all.reg.weight_vector[j] = all.initial_weight;
 }
 
@@ -48,6 +60,7 @@ const size_t buf_size = 512;
 
 void save_load_header(vw& all, io_buf& model_file, bool read, bool text)
 {
+
   char buff[buf_size];
   char buff2[buf_size];
   uint32_t text_len;
@@ -91,7 +104,7 @@ void save_load_header(vw& all, io_buf& model_file, bool read, bool text)
 				buff, text_len, text);
       if (all.default_bits != true && all.num_bits != local_num_bits)
 	{
-	  cout << "Wrong number of bits for source!" << endl;
+	  cout << "vw: -b bits mismatch: command-line " << all.num_bits << " != " << local_num_bits << " stored in model" << endl;
 	  throw exception();
 	}
       all.default_bits = false;
@@ -143,7 +156,8 @@ void save_load_header(vw& all, io_buf& model_file, bool read, bool text)
 	  if (read)
 	    {
 	      string temp(triple,3);
-	      all.triples.push_back(temp);
+	      if (count(all.triples.begin(), all.triples.end(), temp) == 0)
+		all.triples.push_back(temp);
 	    }
 	}
       bin_text_read_write_fixed(model_file,buff,0,
@@ -167,7 +181,7 @@ void save_load_header(vw& all, io_buf& model_file, bool read, bool text)
 				buff,text_len, text);
       for (size_t i = 0; i < ngram_len; i++)
 	{
-	  char ngram[3];
+	  char ngram[3] = {0,0,0};
 	  if (!read) {
 	    text_len = sprintf(buff, "%s ", all.ngram_strings[i].c_str());
 	    memcpy(ngram, all.ngram_strings[i].c_str(), min(3, all.ngram_strings[i].size()));
@@ -195,7 +209,7 @@ void save_load_header(vw& all, io_buf& model_file, bool read, bool text)
 				buff,text_len, text);
       for (size_t i = 0; i < skip_len; i++)
 	{
-	  char skip[3];
+	  char skip[3] = {0,0,0};
 	  if (!read) {
 	    text_len = sprintf(buff, "%s ", all.skip_strings[i].c_str());
 	    memcpy(skip, all.skip_strings[i].c_str(), min(3, all.skip_strings[i].size()));
@@ -215,16 +229,16 @@ void save_load_header(vw& all, io_buf& model_file, bool read, bool text)
 				"", read, 
 				"\n",1, text);
       
-      text_len = sprintf(buff, "options:%s\n", all.options_from_file.c_str());
-      uint32_t len = (uint32_t)all.options_from_file.length()+1;
-      memcpy(buff2, all.options_from_file.c_str(),len);
+      text_len = sprintf(buff, "options:%s\n", all.file_options.c_str());
+      uint32_t len = (uint32_t)all.file_options.length()+1;
+      memcpy(buff2, all.file_options.c_str(),len);
       if (read)
 	len = buf_size;
       bin_text_read_write(model_file,buff2, len, 
 			  "", read,
 			  buff, text_len, text);
       if (read)
-	all.options_from_file.assign(buff2);
+	all.file_options.assign(buff2);
     }
 
 }
@@ -239,7 +253,7 @@ void dump_regressor(vw& all, string reg_name, bool as_text)
   io_temp.open_file(start_name.c_str(), all.stdin_off, io_buf::WRITE);
   
   save_load_header(all, io_temp, false, as_text);
-  all.l.save_load(io_temp, false, as_text);
+  all.l->save_load(io_temp, false, as_text);
 
   io_temp.flush(); // close_file() should do this for me ...
   io_temp.close_file();
@@ -260,36 +274,40 @@ void save_predictor(vw& all, string reg_name, size_t current_pass)
 
 void finalize_regressor(vw& all, string reg_name)
 {
-  if (all.per_feature_regularizer_output.length() > 0)
-    dump_regressor(all, all.per_feature_regularizer_output, false);
-  else
-    dump_regressor(all, reg_name, false);
-  if (all.per_feature_regularizer_text.length() > 0)
-    dump_regressor(all, all.per_feature_regularizer_text, true);
-  else{
-    dump_regressor(all, all.text_regressor_name, true);
-    all.print_invert = true;
-    dump_regressor(all, all.inv_hash_regressor_name, true);
-    all.print_invert = false;
+  if (!all.early_terminate){
+    if (all.per_feature_regularizer_output.length() > 0)
+      dump_regressor(all, all.per_feature_regularizer_output, false);
+    else
+      dump_regressor(all, reg_name, false);
+    if (all.per_feature_regularizer_text.length() > 0)
+      dump_regressor(all, all.per_feature_regularizer_text, true);
+    else{
+      dump_regressor(all, all.text_regressor_name, true);
+      all.print_invert = true;
+      dump_regressor(all, all.inv_hash_regressor_name, true);
+      all.print_invert = false;
+    }
   }
 }
 
 void parse_regressor_args(vw& all, po::variables_map& vm, io_buf& io_temp)
 {
-  if (vm.count("final_regressor")) {
-    all.final_regressor_name = vm["final_regressor"].as<string>();
-    if (!all.quiet)
-      cerr << "final_regressor = " << vm["final_regressor"].as<string>() << endl;
-  }
-  else
-    all.final_regressor_name = "";
-
   vector<string> regs;
   if (vm.count("initial_regressor") || vm.count("i"))
     regs = vm["initial_regressor"].as< vector<string> >();
-  
-  if (regs.size() > 0)
+
+  if (vm.count("input_feature_regularizer"))
+    regs.push_back(vm["input_feature_regularizer"].as<string>());
+
+  if (regs.size() > 0) {
     io_temp.open_file(regs[0].c_str(), all.stdin_off, io_buf::READ);
+    if (!all.quiet) {
+        //cerr << "initial_regressor = " << regs[0] << endl;
+      if (regs.size() > 1) {
+        cerr << "warning: ignoring remaining " << (regs.size() - 1) << " initial regressors" << endl;
+      }
+    }
+  }
 
   save_load_header(all, io_temp, true, false);
 }
@@ -303,26 +321,35 @@ void parse_mask_regressor_args(vw& all, po::variables_map& vm){
       vector<string> init_filename = vm["initial_regressor"].as< vector<string> >();
       if(mask_filename == init_filename[0]){//-i and -mask are from same file, just generate mask
            
-        for (size_t j = 0; j < length; j++){	 
-          if(all.reg.weight_vector[j*all.reg.stride] != 0.)
-            all.reg.weight_vector[j*all.reg.stride + all.feature_mask_idx] = 1.;
-        } 
         return;
       }
     }
+
     //all other cases, including from different file, or -i does not exist, need to read in the mask file
-    weight* temp = all.reg.weight_vector;
     io_buf io_temp_mask;
     io_temp_mask.open_file(mask_filename.c_str(), false, io_buf::READ);
     save_load_header(all, io_temp_mask, true, false);
-    all.l.save_load(io_temp_mask, true, false);
+    all.l->save_load(io_temp_mask, true, false);
     io_temp_mask.close_file();
-    for (size_t j = 0; j < length; j++){	 
-      if(all.reg.weight_vector[j*all.reg.stride] != 0.)
-        temp[j*all.reg.stride + all.feature_mask_idx] = 1.;
+
+    // Deal with the over-written header from initial regressor
+    if (vm.count("initial_regressor")) {
+      vector<string> init_filename = vm["initial_regressor"].as< vector<string> >();
+
+      // Load original header again.
+      io_buf io_temp;
+      io_temp.open_file(init_filename[0].c_str(), false, io_buf::READ);
+      save_load_header(all, io_temp, true, false);
+      io_temp.close_file();
+
+      // Re-zero the weights, in case weights of initial regressor use different indices
+      for (size_t j = 0; j < length; j++){
+        all.reg.weight_vector[j << all.reg.stride_shift] = 0.;
+      }
+    } else {
+      // If no initial regressor, just clear out the options loaded from the header.
+      all.file_options.assign("");
     }
-    free(all.reg.weight_vector);
-    all.reg.weight_vector = temp;
   }
 }
 

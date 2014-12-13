@@ -1,6 +1,6 @@
-AC_INIT([vowpal_wabbit], [7.3.0], [jl@hunch.net])
+AC_INIT([vowpal_wabbit], [7.8], [jl@hunch.net])
 AC_DEFINE([PACKAGE_URL],["https://github.com/JohnLangford/vowpal_wabbit"],[project url])
-AM_CONFIG_HEADER(vowpalwabbit/config.h)
+AC_CONFIG_HEADERS(vowpalwabbit/config.h)
 AM_INIT_AUTOMAKE()
 
 AC_CONFIG_MACRO_DIR([acinclude.d])
@@ -14,6 +14,7 @@ AC_LANG_CPLUSPLUS
 AC_CANONICAL_HOST
 AC_PROG_INSTALL
 AM_PROG_LIBTOOL
+CXXFLAGS='-std=c++0x'
 
 AC_HEADER_STDC
 
@@ -28,6 +29,7 @@ ZLIB_LDFLAGS="-L${ZLIB_HOME}/lib -lz"
 AC_SUBST(ZLIB_CPPFLAGS)
 AC_SUBST(ZLIB_LDFLAGS)
 
+PTHREAD_LIBS=-lpthread
 AX_PTHREAD([], [
   AC_MSG_ERROR([Could not find posix thread library.])
 ])

@@ -3,9 +3,7 @@ Copyright (c) by respective owners including Yahoo!, Microsoft, and
 individual contributors. All rights reserved.  Released under a BSD
 license as described in the file LICENSE.
  */
-#ifndef GD_MF_H
-#define GD_MF_H
-
+#pragma once
 #include <math.h>
 #include "example.h"
 #include "parse_regressor.h"
@@ -13,6 +11,5 @@ license as described in the file LICENSE.
 #include "gd.h"
 
 namespace GDMF{
-  learner setup(vw& all);
+  LEARNER::learner* setup(vw& all, po::variables_map& vm);
 }
-#endif

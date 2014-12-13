@@ -3,10 +3,7 @@ Copyright (c) by respective owners including Yahoo!, Microsoft, and
 individual contributors. All rights reserved.  Released under a BSD
 license as described in the file LICENSE.
  */
-#ifndef IOBUF_H
-#define IOBUF_H
-
-
+#pragma once
 #ifndef _WIN32
 #include <sys/types.h>
 #include <unistd.h>
@@ -44,6 +41,10 @@ class io_buf {
   static const int WRITE = 2;
 
   void init(){
+    space = v_init<char>();
+    files = v_init<int>();
+    currentname = v_init<char>();
+    finalname = v_init<char>();
     size_t s = 1 << 16;
     space.resize(s);
     current = 0;
@@ -82,17 +83,18 @@ class io_buf {
 #endif
       if(ret!=-1)
         files.push_back(ret);
-      else
-	{
-	  cout << "can't open: " << name << " for read or write, exiting on error" << strerror(errno) << endl;
-	  throw exception();
-	}
       break;
 
     default:
       std::cerr << "Unknown file operation. Something other than READ/WRITE specified" << std::endl;
       ret = -1;
     }
+    if (ret == -1 && *name != '\0')
+      {
+	cerr << "can't open: " << name << ", error = " << strerror(errno) << endl;
+	throw exception();
+      }
+    
     return ret;
   }
 
@@ -117,13 +119,13 @@ class io_buf {
 
   void set(char *p){space.end = p;}
 
+  virtual size_t num_files(){ return files.size();}
+
   virtual ssize_t read_file(int f, void* buf, size_t nbytes){
-#ifdef _WIN32
-	  return _read(f, buf, (unsigned int)nbytes); 
-#else
-	  return read(f, buf, (unsigned int)nbytes); 
-#endif
+    return read_file_or_socket(f, buf, nbytes);
   }
+
+  static ssize_t read_file_or_socket(int f, void* buf, size_t nbytes);
 
   size_t fill(int f) {
     if (space.end_array - endloaded == 0)
@@ -142,14 +144,11 @@ class io_buf {
       return 0;
   }
 
-  virtual ssize_t write_file(int f, const void* buf, size_t nbytes)
-  {
-#ifdef _WIN32
-    return _write(f, buf, (unsigned int)nbytes);
-#else
-    return write(f, buf, (unsigned int)nbytes);
-#endif
+  virtual ssize_t write_file(int f, const void* buf, size_t nbytes) {
+    return write_file_or_socket(f, buf, nbytes);
   }
+
+  static ssize_t write_file_or_socket(int f, const void* buf, size_t nbytes);
 
   virtual void flush() {
 	  if (write_file(files[0], space.begin, space.size()) != (int) space.size())
@@ -158,19 +157,21 @@ class io_buf {
 
   virtual bool close_file(){
     if(files.size()>0){
-#ifdef _WIN32
-		_close(files.pop());
-#else
-		close(files.pop());
-#endif
+      close_file_or_socket(files.pop());
       return true;
     }
     return false;
   }
 
+  virtual bool compressed() { return false; }
+
+  static void close_file_or_socket(int f);
+
   void close_files(){
     while(close_file());
   }
+
+  static bool is_socket(int f);
 };
 
 void buf_write(io_buf &o, char* &pointer, size_t n);
@@ -190,7 +191,7 @@ inline size_t bin_read_fixed(io_buf& i, char* data, size_t len, const char* read
       else
 	if (memcmp(data,p,len) != 0)
 	  {
-	    cout << read_message << endl;
+	    cerr << read_message << endl;
 	    throw exception();
 	  }
       return ret;
@@ -272,5 +273,3 @@ inline size_t bin_text_read_write_fixed(io_buf& io, char* data, uint32_t len,
   else
     return bin_text_write_fixed(io, data, len, text_data, text_len, text);
 }
-
-#endif

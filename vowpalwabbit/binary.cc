@@ -1,60 +1,36 @@
-#include "oaa.h"
-#include "vw.h"
+#include "reductions.h"
+#include "multiclass.h"
+#include "simple_label.h"
+
+using namespace LEARNER;
 
 namespace BINARY {
-  struct binary {
-    learner base;
-  };
 
-  void learn(void* d, example* ec)
-  {
-    binary* b = (binary*)d;
-    b->base.learn(ec);
-    
-    float prediction = -1;
-    if ( ec->final_prediction > 0)
-      prediction = 1;
-    ec->final_prediction = prediction;
+  template <bool is_learn>
+  void predict_or_learn(float&, learner& base, example& ec) {
+    if (is_learn)
+      base.learn(ec);
+    else
+      base.predict(ec);
+
+    if ( ec.pred.scalar > 0)
+      ec.pred.scalar = 1;
+    else
+      ec.pred.scalar = -1;
+
+    if (ec.l.simple.label == ec.pred.scalar)
+      ec.loss = 0.;
+    else
+      ec.loss = ec.l.simple.weight;
   }
 
-  void finish(void* d)
-  {
-    binary* b = (binary*)d;
-    b->base.finish();
-    free(b);
-  }
-
-  void drive(vw* all, void* d)
-  {
-    example* ec = NULL;
-    while ( true )
-      {
-        if ((ec = VW::get_example(all->p)) != NULL)//semiblocking operation.
-          {
-            learn(d, ec);
-	    OAA::output_example(*all, ec);
-	    VW::finish_example(*all, ec);
-          }
-        else if (parser_done(all->p))
-	  return;
-        else 
-          ;
-      }
-  }
-
-  learner setup(vw& all, std::vector<std::string>&opts, po::variables_map& vm, po::variables_map& vm_file)
-  {
-    if (!vm_file.count("binary")) 
-      {
-	std::stringstream ss;
-	ss << " --binary ";
-	all.options_from_file.append(ss.str());
-      }
-
+  learner* setup(vw& all, po::variables_map& vm)
+  {//parse and set arguments
     all.sd->binary_label = true;
-    binary* data = (binary*)calloc(1,sizeof(binary));
-    data->base = all.l;
-    learner l(data, drive, learn, finish, all.l.sl);
-    return l;
+    //Create new learner
+    learner* ret = new learner(NULL, all.l);
+    ret->set_learn<float, predict_or_learn<true> >();
+    ret->set_predict<float, predict_or_learn<false> >();
+    return ret;
   }
 }
